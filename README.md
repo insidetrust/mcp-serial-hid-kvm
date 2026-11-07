@@ -75,8 +75,31 @@ Custom KVM server address:
 | `SHKVM_API_PORT` | `9329` | KVM server port |
 | `SHKVM_OCR_CMD` | auto-detect | Path to tesseract executable |
 | `SHKVM_CAPTURE_LOG_DIR` | platform default | Capture log directory (empty string to disable) |
+| `SHKVM_ACTION_LOG` | platform default | Action log file (empty string to disable, which also refuses all input) |
+| `SHKVM_COLOUR_CORRECT` | `1` | Apply the capture device's measured colour correction to every frame |
+| `SHKVM_PRESEND_EVIDENCE` | `1` | Save the frame from just before each input action and cite it in the log |
 
 Hardware settings (`SHKVM_SERIAL_PORT`, `SHKVM_SCREEN_WIDTH`, etc.) are configured on the **KVM server side**, not here. If the target PC uses a non-US keyboard, set `--target-layout` (or `SHKVM_TARGET_LAYOUT`) on the KVM server so that `type_text` and `send_key` produce correct characters.
+
+### Action log
+
+Every tool that puts input into the target writes a row to the action log
+*before* it acts, and refuses to act if it cannot write one. The order is
+deliberate: a crash partway through a send can leave input that was delivered,
+and an unrecorded keystroke on someone else's machine is the one outcome worth
+designing against. The opposite error, a row saying "sent" when transmission
+failed, is corrected by a following row rather than by deleting anything.
+
+Each input row also cites the frame captured immediately before delivery, so
+the row answers "what was on screen when this was typed" on its own: which
+window had focus, what was showing, whether a field was waiting for a password.
+Evidence is best effort while the log is not, because the ability to drive a
+target must not depend on the capture card: a target that is asleep has no
+picture, and that is exactly when input is needed. Where there was no picture
+the row says so.
+
+Set `SHKVM_ACTION_LOG=""` to turn logging off, which also disables every input
+tool. There is no mode that sends input without recording it.
 
 ## Available Tools
 

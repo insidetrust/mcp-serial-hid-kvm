@@ -31,6 +31,16 @@ class Config:
             "SHKVM_COLOUR_CORRECT", "1"
         ).strip().lower() not in ("0", "false", "no", "off")
 
+        # Attach the frame captured just before an input action as that
+        # action's evidence (see server._presend_evidence). On by default: an
+        # input row that cannot show the screen it went into is the weaker
+        # half of the record. Set SHKVM_PRESEND_EVIDENCE=0 to turn it off,
+        # which costs one frame grab less per keystroke and an answer to
+        # "what had focus".
+        self.presend_evidence: bool = os.environ.get(
+            "SHKVM_PRESEND_EVIDENCE", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
         # Capture log directory
         raw = os.environ.get("SHKVM_CAPTURE_LOG_DIR")
         if raw is None:

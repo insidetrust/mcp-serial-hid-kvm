@@ -17,6 +17,7 @@ dependencies = [
     "serial-hid-kvm",
     "mcp>=1.0.0",
     "pillow>=10.0.0",
+    "numpy>=1.24",
     "pytesseract>=0.3.10",
 ]
 

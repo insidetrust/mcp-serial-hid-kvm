@@ -21,7 +21,7 @@ from PIL import Image
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
-from . import actionlog, colour
+from . import actionlog, colour, frames
 from .config import config
 from .ocr import TerminalOCR
 
@@ -92,12 +92,28 @@ def _acting(action: str, cls: str = "RO", context: str = ""):
     recorded as uncertain rather than as not having happened: the daemon
     validates a whole string before sending any key, but a fault partway
     through can still leave characters delivered.
+
+    The frame captured just before delivery becomes the row's evidence, so an
+    input row answers "what was on screen when this was typed" without relying
+    on a nearby capture row having been taken. That is the question asked of an
+    input row afterwards: which window had focus, what prompt was showing,
+    whether a field was waiting for a password. The operator console already
+    records its sends this way, so this makes an agent row and an operator row
+    mean the same thing in a merged timeline.
+
+    Evidence is best effort; the log is not. An input that cannot be logged is
+    refused, while an input whose pre-send frame cannot be captured still goes,
+    because the ability to drive a target must not depend on the capture card.
+    A target that is asleep or unplugged has no picture, and reaching it is
+    exactly when input is needed.
     """
     log = get_log()
     log.require()  # refuses here, before anything reaches the target
+    evidence, note = _presend_evidence()
     log.append(
         action=action,
-        result="sent through the HID bridge",
+        result="sent through the HID bridge" + note,
+        evidence=evidence,
         cls=cls,
         context=context,
     )
@@ -116,37 +132,84 @@ def _acting(action: str, cls: str = "RO", context: str = ""):
         raise
 
 
-def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
-    """Save a capture image to the log directory if configured."""
+def _frame_path(log_dir: str, suffix: str) -> str:
+    """A free filename for a frame, within the second.
+
+    The stamp has one-second resolution, so two frames saved in the same second
+    under the same suffix used to land on one name and the first was lost. An
+    evidence path that silently resolves to another row's frame is worse than
+    no path at all, and a burst of key presses reaches that rate easily.
+    """
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    tag = f"_{suffix}" if suffix else ""
+    path = os.path.join(log_dir, f"{stamp}{tag}.jpg")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(log_dir, f"{stamp}{tag}-{n}.jpg")
+        n += 1
+    return path
+
+
+def _write_frame(image: Image.Image, suffix: str = "") -> str | None:
+    """Save a frame to the capture directory. Writes no log row."""
     log_dir = config.capture_log_dir
     if log_dir is None:
         return None
-
     try:
         os.makedirs(log_dir, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        tag = f"_{suffix}" if suffix else ""
-        filename = f"{ts}{tag}.jpg"
-        filepath = os.path.join(log_dir, filename)
-        image.save(filepath, format="JPEG", quality=85)
+        filepath = _frame_path(log_dir, suffix)
+        image.convert("RGB").save(filepath, format="JPEG", quality=85)
         logger.info(f"Capture log saved: {filepath}")
-        try:
-            note = colour.describe() if config.colour_correct else "raw frame"
-            get_log().append(
-                action=f"capture_screen ({suffix or 'capture'})",
-                result=f"{image.width}x{image.height}; {note}",
-                evidence=filepath,
-                cls="RO",
-                context="",
-            )
-        except actionlog.LogUnavailable:
-            # A capture that cannot be logged is worth less but is not
-            # dangerous. An unlogged INPUT is, and _acting refuses that.
-            logger.warning("capture not recorded in the action log")
         return filepath
     except Exception as e:
         logger.warning(f"Failed to save capture log: {e}")
         return None
+
+
+def _presend_evidence() -> tuple[str, str]:
+    """The screen as it stood immediately before input is delivered.
+
+    Returns the evidence path and a note for the result cell, either of which
+    may be empty. Nothing here raises: see _acting on why input must not be
+    made to depend on the capture device.
+    """
+    if not config.presend_evidence:
+        return "", ""
+    try:
+        image = _capture_image()
+    except Exception as exc:
+        logger.warning(f"no pre-send frame for the action log: {exc}")
+        return "", "; no pre-send frame, capture unavailable"
+
+    stdev = frames.frame_stdev(image)
+    path = _write_frame(image, "presend") or ""
+    if frames.is_blank(stdev):
+        # Worth saying in the row. Input sent against a frame with no picture
+        # may have gone nowhere visible, or into a window nobody chose, and
+        # the saved frame on its own does not show that this was known.
+        return path, f"; screen carried no picture (spread {stdev:.2f})"
+    return path, ""
+
+
+def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
+    """Save a capture image to the log directory and record it."""
+    filepath = _write_frame(image, suffix)
+    if filepath is None:
+        return None
+    try:
+        note = colour.describe() if config.colour_correct else "raw frame"
+        get_log().append(
+            action=f"capture_screen ({suffix or 'capture'})",
+            result=f"{image.width}x{image.height}; {note}",
+            evidence=filepath,
+            cls="RO",
+            context="",
+        )
+    except actionlog.LogUnavailable:
+        # A capture that cannot be logged is worth less but is not
+        # dangerous. An unlogged INPUT is, and _acting refuses that.
+        logger.warning("capture not recorded in the action log")
+    return filepath
 
 
 def _capture_image(quality: int = 85) -> Image.Image:
