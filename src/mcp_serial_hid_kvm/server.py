@@ -20,6 +20,7 @@ from PIL import Image
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
+from . import colour
 from .config import config
 from .ocr import TerminalOCR
 
@@ -68,9 +69,22 @@ def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
 
 
 def _capture_image(quality: int = 85) -> Image.Image:
-    """Fetch a frame from KVM server and return as PIL Image."""
+    """Fetch a frame from KVM server and return as PIL Image.
+
+    The capture device does not return a neutral white (see colour.py), so the
+    correction is applied here, at the single point every tool fetches a frame
+    through. capture_screen, get_screen_text and execute_and_read therefore all
+    see the same corrected picture, and so does anything written to the capture
+    log.
+
+    Set SHKVM_COLOUR_CORRECT=0 to get raw frames.
+    """
     jpeg_bytes, w, h = get_client().capture_frame_jpeg(quality)
-    return Image.open(io.BytesIO(jpeg_bytes))
+    image = Image.open(io.BytesIO(jpeg_bytes))
+    image.load()
+    if config.colour_correct:
+        image = colour.correct(image)
+    return image
 
 
 # Create MCP server
@@ -533,3 +547,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -24,6 +24,13 @@ class Config:
         # Local OCR
         self.tesseract_cmd: str | None = os.environ.get("SHKVM_OCR_CMD")
 
+        # Capture device colour correction (see colour.py). On by default: an
+        # uncorrected frame misrepresents the target's screen, and a mixed
+        # evidence set is worse than a consistently corrected one.
+        self.colour_correct: bool = os.environ.get(
+            "SHKVM_COLOUR_CORRECT", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
         # Capture log directory
         raw = os.environ.get("SHKVM_CAPTURE_LOG_DIR")
         if raw is None:
