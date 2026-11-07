@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from mcp.server import Server
@@ -210,6 +211,52 @@ def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
         # dangerous. An unlogged INPUT is, and _acting refuses that.
         logger.warning("capture not recorded in the action log")
     return filepath
+
+
+# Longest a command is waited on before the screen is read anyway. Long
+# enough for the slow end of a build review (system_profiler, a large
+# find) without hanging a session on something that never settles.
+DEFAULT_SETTLE_TIMEOUT_S = 20.0
+SETTLE_POLL_S = 0.15
+SETTLE_QUIET_FRAMES = 3
+
+
+async def _wait_for_settle(
+    min_wait_s: float,
+    timeout_s: float = DEFAULT_SETTLE_TIMEOUT_S,
+) -> tuple[Image.Image, float, bool]:
+    """Wait until the screen stops changing, then return the frame.
+
+    A fixed wait is wrong in both directions: too short and the screen is read
+    while the command is still producing output, which is the dangerous one
+    because the result looks like a finished answer; too long and every quick
+    command costs the slowest command's wait.
+
+    The capture path itself is not the reason to wait. Measured on this card,
+    an instant command's output was in the first frame fetched after Enter,
+    within 200ms. What needs waiting for is the command.
+
+    Returns the frame, how long was waited, and whether it settled. A read
+    that timed out is reported as such rather than presented as a result: the
+    screen may be mid-output, and saying so is the difference between a
+    partial answer and a wrong one.
+    """
+    deadline = time.monotonic() + max(timeout_s, min_wait_s)
+    floor = time.monotonic() + max(0.0, min_wait_s)
+    started = time.monotonic()
+
+    image = _capture_image()
+    previous = frames.signature(image)
+    quiet = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(SETTLE_POLL_S)
+        image = _capture_image()
+        current = frames.signature(image)
+        quiet = quiet + 1 if frames.is_quiet(frames.difference(previous, current)) else 0
+        previous = current
+        if quiet >= SETTLE_QUIET_FRAMES and time.monotonic() >= floor:
+            return image, time.monotonic() - started, True
+    return image, time.monotonic() - started, False
 
 
 def _capture_image(quality: int = 85) -> Image.Image:
@@ -464,7 +511,13 @@ def _tool_definitions() -> list[Tool]:
         ),
         Tool(
             name="execute_and_read",
-            description="Type a command, press Enter, wait for output, then capture screen and OCR. Convenient for running shell commands on the target PC.",
+            description=(
+                "Type a command, press Enter, wait for the screen to stop "
+                "changing, then capture and OCR it. Waits for the command "
+                "rather than for a fixed time, so a slow command is not read "
+                "while it is still producing output; if it never settles the "
+                "result says so instead of looking finished."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -474,7 +527,19 @@ def _tool_definitions() -> list[Tool]:
                     },
                     "wait_seconds": {
                         "type": "number",
-                        "description": "Seconds to wait for output (default: 1.0)",
+                        "description": (
+                            "Minimum seconds to wait before the screen may be "
+                            "considered settled (default: 1.0). Raise it for a "
+                            "command that pauses before producing output."
+                        ),
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": (
+                            "Longest to wait for the screen to stop changing "
+                            "(default: 20). On timeout the output is returned "
+                            "with a warning that it may be partial."
+                        ),
                     },
                 },
                 "required": ["command"],
@@ -651,6 +716,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         elif name == "execute_and_read":
             command = arguments["command"]
             wait_seconds = arguments.get("wait_seconds", 1.0)
+            timeout_seconds = arguments.get("timeout_seconds", DEFAULT_SETTLE_TIMEOUT_S)
 
             # Raw mode: no tag interpretation for command text
             validate_chars(command)
@@ -658,11 +724,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 client.type_text(command, raw=True)
                 await asyncio.sleep(0.1)
                 client.send_key("enter")
-            await asyncio.sleep(wait_seconds)
 
-            image = _capture_image()
+            image, waited, settled = await _wait_for_settle(wait_seconds, timeout_seconds)
             _save_capture_log(image, "exec")
             text = get_ocr().extract_text(image)
+            if not settled:
+                # Say it in the returned text, not only the log. A partial
+                # screen read as a finished answer is the failure this is
+                # here to prevent, and the caller is what needs warning.
+                note = (
+                    f"[WARNING: the screen was still changing after "
+                    f"{waited:.1f}s, so this may be partial output. Capture "
+                    f"again, or raise timeout_seconds.]" + chr(10)
+                )
+                text = note + text
             return [TextContent(type="text", text=text)]
 
         elif name == "get_device_info":

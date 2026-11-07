@@ -31,6 +31,34 @@ def frame_stdev(image: Image.Image) -> float:
     return float(np.asarray(small, dtype=np.float32).std())
 
 
+# Mean absolute difference below which two frames are treated as the same
+# picture. Measured on this capture card against a static terminal: the floor
+# between consecutive frames, cursor blink and sensor noise included, sat at
+# 0.039. This is 25x that, so a blinking cursor cannot read as activity while
+# a single new line of output reads as activity easily.
+QUIET_DIFF = 1.0
+
+
+def signature(image: Image.Image):
+    """A small greyscale array, for comparing one frame against another.
+
+    Downsampled for the same reason frame_stdev is: whole-screen change is
+    what is being detected, and this runs in a polling loop.
+    """
+    small = image.convert("L").resize((320, 180))
+    return np.asarray(small, dtype=np.float32)
+
+
+def difference(a, b) -> float:
+    """Mean absolute difference between two signatures, on a 0-255 scale."""
+    return float(np.abs(a - b).mean())
+
+
+def is_quiet(diff: float) -> bool:
+    """Whether two frames are the same picture, allowing for noise."""
+    return diff < QUIET_DIFF
+
+
 def is_blank(stdev: float) -> bool:
     """Whether a measured spread means the frame carries no picture.
 
@@ -41,4 +69,12 @@ def is_blank(stdev: float) -> bool:
     return stdev < BLANK_STDEV
 
 
-__all__ = ["BLANK_STDEV", "frame_stdev", "is_blank"]
+__all__ = [
+    "BLANK_STDEV",
+    "QUIET_DIFF",
+    "difference",
+    "frame_stdev",
+    "is_blank",
+    "is_quiet",
+    "signature",
+]

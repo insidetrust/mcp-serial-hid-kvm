@@ -307,6 +307,66 @@ def test_every_input_tool_is_an_acting_tool():
     )
 
 
+def test_settle_returns_once_the_screen_stops_changing():
+    """A quick command must not cost the slowest command's wait."""
+    import asyncio
+
+    frame = textured_frame()
+    with Harness() as h:
+        server._capture_image = lambda quality=85: frame  # identical every poll
+        image, waited, settled = asyncio.run(server._wait_for_settle(0.0, timeout_s=5.0))
+        check(settled is True, "an unchanging screen must settle")
+        check(waited < 2.0, f"settling took {waited:.2f}s on a static screen")
+        check(image is frame, "the settled frame is what comes back")
+
+
+def test_settle_waits_while_output_is_still_arriving():
+    """The case this exists for. A command still writing to the screen must
+    not be read as finished: that is the failure that looks like an answer."""
+    import asyncio
+
+    with Harness() as h:
+        changing = {"n": 0}
+
+        def busy(quality=85):
+            # A different picture every poll, as output scrolls past.
+            changing["n"] += 1
+            image = Image.new("RGB", (320, 180))
+            for x in range(0, 320, 2):
+                for y in range(180):
+                    image.putpixel((x, y), (changing["n"] * 37 % 256, 128, 200))
+            return image
+
+        server._capture_image = busy
+        _image, waited, settled = asyncio.run(
+            server._wait_for_settle(0.0, timeout_s=1.5)
+        )
+        check(settled is False, "a changing screen must not report as settled")
+        check(waited >= 1.5, f"it must wait out the timeout, waited {waited:.2f}s")
+
+
+def test_settle_honours_the_minimum_wait():
+    """Some commands pause before printing anything. Returning during that
+    pause would read an empty screen as the finished answer."""
+    import asyncio
+
+    frame = textured_frame()
+    with Harness() as h:
+        server._capture_image = lambda quality=85: frame
+        _image, waited, settled = asyncio.run(server._wait_for_settle(1.0, timeout_s=5.0))
+        check(settled is True, "it still settles")
+        check(waited >= 1.0, f"the minimum wait was not honoured: {waited:.2f}s")
+
+
+def test_quiet_threshold_is_well_clear_of_capture_noise():
+    """QUIET_DIFF is set from a measurement, and the measurement is recorded
+    in the module. This guards the ordering, not the exact number."""
+    a = frames.signature(textured_frame())
+    check(frames.difference(a, a) == 0.0, "a frame must not differ from itself")
+    check(frames.is_quiet(0.039), "the measured noise floor must read as quiet")
+    check(not frames.is_quiet(5.0), "a real screen change must not read as quiet")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:
