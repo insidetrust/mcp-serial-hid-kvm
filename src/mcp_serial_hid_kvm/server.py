@@ -6,6 +6,7 @@ via TCP.  OCR is run locally using frames fetched from the KVM server.
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import io
 import json
@@ -20,7 +21,7 @@ from PIL import Image
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
-from . import colour
+from . import actionlog, colour
 from .config import config
 from .ocr import TerminalOCR
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 # Global instances
 _client: KvmClient | None = None
 _ocr: TerminalOCR | None = None
+_log: "actionlog.ActionLog | None" = None
 
 
 def get_client() -> KvmClient:
@@ -48,6 +50,72 @@ def get_ocr() -> TerminalOCR:
     return _ocr
 
 
+def get_log() -> actionlog.ActionLog:
+    global _log
+    if _log is None:
+        _log = actionlog.ActionLog(actionlog.resolve_path(), actor=actionlog.AGENT)
+    return _log
+
+
+# Tools that put input into the target. These are the ones that must be logged
+# before they act, and that carry an action class.
+INPUT_TOOLS = {
+    "type_text",
+    "send_key",
+    "send_key_sequence",
+    "mouse_move",
+    "mouse_click",
+    "mouse_drag",
+    "mouse_scroll",
+    "execute_and_read",
+}
+
+ACTION_CLASS_PROP = {
+    "type": "string",
+    "enum": list(actionlog.CLASSES),
+    "description": (
+        "Action class recorded in the engagement action log: RO read-only, "
+        "LIC low-impact change, SC state-changing. Defaults to RO. Set it "
+        "honestly; where an action could be either, use the higher class."
+    ),
+}
+
+
+@contextlib.contextmanager
+def _acting(action: str, cls: str = "RO", context: str = ""):
+    """Log an input action, then perform it.
+
+    The row goes down BEFORE the keystrokes, so a crash mid-send can never
+    leave input that was delivered but unrecorded. The cost is the opposite
+    error, a row that says "sent" when transmission failed, so a failure
+    appends a correction naming the error. Delivery after a serial fault is
+    recorded as uncertain rather than as not having happened: the daemon
+    validates a whole string before sending any key, but a fault partway
+    through can still leave characters delivered.
+    """
+    log = get_log()
+    log.require()  # refuses here, before anything reaches the target
+    log.append(
+        action=action,
+        result="sent through the HID bridge",
+        cls=cls,
+        context=context,
+    )
+    try:
+        yield
+    except Exception as exc:
+        try:
+            log.correction(
+                of=action,
+                problem=f"transmission FAILED ({exc}); delivery uncertain, verify on screen",
+                cls=cls,
+                context=context,
+            )
+        except actionlog.LogUnavailable:
+            pass
+        raise
+
+
 def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
     """Save a capture image to the log directory if configured."""
     log_dir = config.capture_log_dir
@@ -62,6 +130,19 @@ def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
         filepath = os.path.join(log_dir, filename)
         image.save(filepath, format="JPEG", quality=85)
         logger.info(f"Capture log saved: {filepath}")
+        try:
+            note = colour.describe() if config.colour_correct else "raw frame"
+            get_log().append(
+                action=f"capture_screen ({suffix or 'capture'})",
+                result=f"{image.width}x{image.height}; {note}",
+                evidence=filepath,
+                cls="RO",
+                context="",
+            )
+        except actionlog.LogUnavailable:
+            # A capture that cannot be logged is worth less but is not
+            # dangerous. An unlogged INPUT is, and _acting refuses that.
+            logger.warning("capture not recorded in the action log")
         return filepath
     except Exception as e:
         logger.warning(f"Failed to save capture log: {e}")
@@ -93,7 +174,21 @@ app = Server("mcp-serial-hid-kvm")
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available tools."""
+    """List available tools.
+
+    Every input tool gains an `action_class` property here rather than in each
+    schema by hand, so the set cannot drift from INPUT_TOOLS.
+    """
+    tools = _tool_definitions()
+    for tool in tools:
+        if tool.name in INPUT_TOOLS:
+            tool.inputSchema.setdefault("properties", {})[
+                "action_class"
+            ] = dict(ACTION_CLASS_PROP)
+    return tools
+
+
+def _tool_definitions() -> list[Tool]:
     return [
         Tool(
             name="type_text",
@@ -380,33 +475,46 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
     """Handle tool calls."""
     try:
         client = get_client()
+        # Every input tool is logged before it acts, and refuses if it cannot
+        # be logged. The caller sets the class; RO is only the default.
+        cls = arguments.get("action_class", "RO")
 
         if name == "type_text":
             text = arguments["text"]
             char_delay = arguments.get("char_delay_ms")
             raw = arguments.get("raw", False)
             validate_chars(text)
-            result = client.type_text(text, char_delay, raw=raw)
+            with _acting(f"type_text: {text}", cls):
+                client.type_text(text, char_delay, raw=raw)
             return [TextContent(type="text", text=f"Typed {len(text)} characters")]
 
         elif name == "send_key":
             key = arguments["key"]
             modifiers = arguments.get("modifiers", [])
-            client.send_key(key, modifiers)
+            combo = "+".join(list(modifiers) + [key])
+            with _acting(f"send_key: {combo}", cls):
+                client.send_key(key, modifiers)
             mod_str = "+".join(modifiers) + "+" if modifiers else ""
             return [TextContent(type="text", text=f"Sent: {mod_str}{key}")]
 
         elif name == "send_key_sequence":
             steps = arguments["steps"]
             default_delay = arguments.get("default_delay_ms", 100)
-            client.send_key_sequence(steps, default_delay)
+            summary = ", ".join(
+                "+".join(list(s.get("modifiers") or []) + [s.get("key", "?")])
+                for s in steps
+            )
+            with _acting(f"send_key_sequence: {summary}", cls):
+                client.send_key_sequence(steps, default_delay)
             return [TextContent(type="text", text=f"Sent {len(steps)} key steps")]
 
         elif name == "mouse_move":
             x = arguments["x"]
             y = arguments["y"]
             relative = arguments.get("relative", False)
-            client.mouse_move(x, y, relative)
+            kind = "relative" if relative else "absolute"
+            with _acting(f"mouse_move: {kind} ({x}, {y})", cls):
+                client.mouse_move(x, y, relative)
             if relative:
                 return [TextContent(type="text", text=f"Moved mouse by ({x}, {y})")]
             else:
@@ -416,9 +524,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             button = arguments.get("button", "left")
             x = arguments.get("x")
             y = arguments.get("y")
-            client.mouse_click(button, x, y)
-            pos_str = f" at ({x}, {y})" if x is not None and y is not None else ""
-            return [TextContent(type="text", text=f"Clicked {button}{pos_str}")]
+            where = f" at ({x}, {y})" if x is not None and y is not None else ""
+            with _acting(f"mouse_click: {button}{where}", cls):
+                client.mouse_click(button, x, y)
+            return [TextContent(type="text", text=f"Clicked {button}{where}")]
 
         elif name == "mouse_drag":
             start_x = arguments["start_x"]
@@ -426,11 +535,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             end_x = arguments["end_x"]
             end_y = arguments["end_y"]
             button = arguments.get("button", "left")
-            client.mouse_down(button, start_x, start_y)
-            await asyncio.sleep(0.05)
-            client.mouse_move(end_x, end_y)
-            await asyncio.sleep(0.05)
-            client.mouse_up(button, end_x, end_y)
+            action = (
+                f"mouse_drag: {button} ({start_x}, {start_y}) to ({end_x}, {end_y})"
+            )
+            with _acting(action, cls):
+                client.mouse_down(button, start_x, start_y)
+                await asyncio.sleep(0.05)
+                client.mouse_move(end_x, end_y)
+                await asyncio.sleep(0.05)
+                client.mouse_up(button, end_x, end_y)
             return [TextContent(
                 type="text",
                 text=f"Dragged {button} from ({start_x}, {start_y}) to ({end_x}, {end_y})",
@@ -438,7 +551,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "mouse_scroll":
             amount = arguments["amount"]
-            client.mouse_scroll(amount)
+            with _acting(f"mouse_scroll: {amount}", cls):
+                client.mouse_scroll(amount)
             direction = "up" if amount > 0 else "down"
             return [TextContent(type="text", text=f"Scrolled {direction} by {abs(amount)}")]
 
@@ -477,9 +591,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
             # Raw mode: no tag interpretation for command text
             validate_chars(command)
-            client.type_text(command, raw=True)
-            await asyncio.sleep(0.1)
-            client.send_key("enter")
+            with _acting(f"execute_and_read: {command} then Enter", cls):
+                client.type_text(command, raw=True)
+                await asyncio.sleep(0.1)
+                client.send_key("enter")
             await asyncio.sleep(wait_seconds)
 
             image = _capture_image()
@@ -547,4 +662,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
