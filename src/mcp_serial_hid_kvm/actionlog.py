@@ -24,6 +24,7 @@ than as malformed.
 from __future__ import annotations
 
 import datetime
+import re
 import os
 import platform
 from pathlib import Path
@@ -45,6 +46,10 @@ CLASS_LABELS = {
 }
 
 ROW_COLUMNS = 7
+
+# "2026-11-07 10:31" as written here, or a bare "21:19" as some hand-written
+# rows carry. Anything else in the first cell is not an action row.
+_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}(\s*-\s*\d{1,2}:\d{2})?$")
 
 
 class LogUnavailable(RuntimeError):
@@ -194,21 +199,31 @@ class ActionLog:
 
 
 def parse_row(line: str) -> dict | None:
-    """Parse one log row, tolerating the six-column rows written before the
-    actor column existed. Returns None for anything that is not a row."""
+    """Parse one log row, tolerating rows written before the actor column.
+
+    Column count alone does not identify the format. A legacy row can carry a
+    spare trailing cell and so arrive with seven, which made an earlier version
+    read its class column as the actor and report actors called "RO" and "LOW".
+    So the actor is identified by its value, not by its position.
+    """
     s = line.strip()
     if not s.startswith("|") or not s.endswith("|"):
         return None
     cells = [c.strip() for c in s[1:-1].split("|")]
-    if len(cells) == ROW_COLUMNS:
-        ts, actor, cls, context, action, result, evidence = cells
-    elif len(cells) == ROW_COLUMNS - 1:
-        ts, cls, context, action, result, evidence = cells
+
+    if len(cells) >= ROW_COLUMNS and cells[1] in ACTORS:
+        ts, actor, cls, context, action, result, evidence = cells[:ROW_COLUMNS]
+    elif len(cells) >= ROW_COLUMNS - 1:
+        ts, cls, context, action, result, evidence = cells[: ROW_COLUMNS - 1]
         actor = ""  # legacy row, written before actors were recorded
     else:
         return None
-    if not ts or ts[0].isalpha():
-        return None  # a Markdown table header, not an action
+
+    # The first cell must actually look like a time. This rejects Markdown
+    # table headers and the `| --- | --- |` separator rows that sit in a
+    # hand-maintained log, which would otherwise be read as actions.
+    if not _TIMESTAMP_RE.match(ts):
+        return None
     return {
         "time": ts,
         "actor": actor,
@@ -231,3 +246,5 @@ def _cell(value: str) -> str:
     text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\n", " <NL> ").replace("|", "<PIPE>")
     return " ".join(text.split()).strip()
+
+
