@@ -64,10 +64,19 @@ def is_quiet(diff: float) -> bool:
 # dominant flat background whichever theme it uses; a lock screen wallpaper,
 # a screensaver or a bare photo desktop does not.
 #
-# Measured on this engagement's captures: lock screens and a photo desktop
-# scored 19.0-20.1%, terminals 58.4-94.8%, and a light terminal inverted to
-# simulate a dark theme still scored 91.4%. The threshold sits in the gap.
-UI_FLAT_MIN = 0.40
+# Measured on this engagement's captures, all from a macOS target: lock
+# screens and a photo desktop scored 19.0-20.1%, terminals 58.4-94.8%, and a
+# light terminal inverted to simulate a dark theme still scored 91.4%. The
+# threshold sits in that gap.
+#
+# That calibration is macOS only, and the number should not be trusted
+# elsewhere without re-measuring. A Windows desktop is commonly a solid
+# colour, which would read as almost perfectly flat and pass a threshold
+# chosen to reject a photographic wallpaper: the opposite failure to the one
+# seen here. This is why the check guards only a shell command, where a flat
+# screen is a reasonable expectation, and why the blank check below carries
+# every keystroke: a sleeping display is black on every operating system.
+FLAT_BACKGROUND_MIN = 0.40
 
 
 def flat_fraction(image: Image.Image, tol: int = 8) -> float:
@@ -85,16 +94,22 @@ def flat_fraction(image: Image.Image, tol: int = 8) -> float:
     return float(widened.max() / g.size)
 
 
-def looks_like_ui(fraction: float) -> bool:
-    """Whether a frame looks like somewhere typed text would go.
+def has_flat_background(fraction: float) -> bool:
+    """Whether a frame is dominated by one flat shade, as a terminal is.
 
-    This is a partial check and worth being honest about. It catches a locked
-    screen, a screensaver and a bare photo desktop, which is the failure that
-    has actually happened twice. It does NOT catch typing into the wrong
-    application, since Slack and a terminal both read as interfaces, and it
-    would pass a lock screen set to a plain colour.
+    Used only where a terminal is expected. It is not a lock-screen detector
+    and must not be read as one: measured on a macOS target, an unlocked
+    desktop with an application window open scored 19.3% against a lock
+    screen's 19.0-20.1%, because the same wallpaper fills both and the menu
+    bar and dock are too thin and too translucent to shift a whole-frame
+    statistic. A top-strip and a dock-band measurement were tried and separate
+    no better.
+
+    What is reliably detectable across operating systems is a blank frame, so
+    that is what guards every keystroke. This only guards a shell command,
+    where expecting something that looks like a shell is reasonable.
     """
-    return fraction >= UI_FLAT_MIN
+    return fraction >= FLAT_BACKGROUND_MIN
 
 
 def is_blank(stdev: float) -> bool:
@@ -109,9 +124,9 @@ def is_blank(stdev: float) -> bool:
 
 __all__ = [
     "BLANK_STDEV",
-    "UI_FLAT_MIN",
+    "FLAT_BACKGROUND_MIN",
     "flat_fraction",
-    "looks_like_ui",
+    "has_flat_background",
     "QUIET_DIFF",
     "difference",
     "frame_stdev",

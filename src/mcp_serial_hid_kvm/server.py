@@ -98,7 +98,13 @@ ACTION_CLASS_PROP = {
 
 
 @contextlib.contextmanager
-def _acting(action: str, cls: str = "RO", context: str = "", keyboard: bool = True):
+def _acting(
+    action: str,
+    cls: str = "RO",
+    context: str = "",
+    keyboard: bool = True,
+    expect_terminal: bool = False,
+):
     """Log an input action, then perform it.
 
     The row goes down BEFORE the keystrokes, so a crash mid-send can never
@@ -128,7 +134,7 @@ def _acting(action: str, cls: str = "RO", context: str = "", keyboard: bool = Tr
     evidence, note, frame = _presend_evidence()
 
     if keyboard:
-        refusal = _refuse_keystrokes(frame)
+        refusal = _refuse_keystrokes(frame, expect_terminal)
         if refusal is not None:
             # A refusal is evidence too: it records that the target was in a
             # state nobody should have typed into, at a time somebody tried.
@@ -231,7 +237,9 @@ def _presend_evidence() -> tuple[str, str, Image.Image | None]:
     return path, "", image
 
 
-def _refuse_keystrokes(image: Image.Image | None) -> str | None:
+def _refuse_keystrokes(
+    image: Image.Image | None, expect_terminal: bool = False
+) -> str | None:
     """Why keystrokes must not be sent against this frame, or None to proceed.
 
     Two refusals, and the second is the one that matters. Without a frame there
@@ -270,15 +278,30 @@ def _refuse_keystrokes(image: Image.Image | None) -> str | None:
             "capture. Set SHKVM_FOCUS_GUARD=0 to override."
         )
 
+    if not expect_terminal:
+        # Driving a graphical interface is a first-class use, and the
+        # interface check below cannot serve it. Measured on this target, an
+        # unlocked desktop with an application window open scored 19.3% flat
+        # against a lock screen's 19.0-20.1%: the same wallpaper fills both,
+        # and the menu bar and dock are translucent and thin enough to be
+        # swamped. The top strip and the dock band were tried too and separate
+        # no better. So for anything but a shell command the blank check above
+        # is the whole guard, because it is the part that is actually
+        # measurable.
+        return None
+
     fraction = frames.flat_fraction(image)
-    if not frames.looks_like_ui(fraction):
+    if not frames.has_flat_background(fraction):
         return (
-            f"refusing to type: the screen does not look like an interface "
+            f"refusing to run a command: the screen does not look like a "
+            f"terminal "
             f"({fraction:.0%} of it sits at one shade, against a threshold of "
-            f"{frames.UI_FLAT_MIN:.0%}). That is what a locked screen, a "
-            "screensaver or a bare desktop looks like, and keystrokes sent now "
-            "would most likely go into a login field. Capture the screen and "
-            "look before sending. Set SHKVM_FOCUS_GUARD=0 to override."
+            f"{frames.FLAT_BACKGROUND_MIN:.0%}). A locked screen, a screensaver and a "
+            "desktop with a wallpaper all look like this, and a shell command "
+            "sent now would most likely go into a login field. Capture the "
+            "screen and look. If you meant to drive a graphical interface "
+            "rather than run a command, use type_text and the mouse tools, "
+            "which are not held to this check. SHKVM_FOCUS_GUARD=0 overrides."
         )
     return None
 
@@ -811,7 +834,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
             # Raw mode: no tag interpretation for command text
             validate_chars(command)
-            with _acting(f"execute_and_read: {command} then Enter", cls):
+            with _acting(
+                f"execute_and_read: {command} then Enter", cls, expect_terminal=True
+            ):
                 client.type_text(command, raw=True)
                 await asyncio.sleep(0.1)
                 client.send_key("enter")
