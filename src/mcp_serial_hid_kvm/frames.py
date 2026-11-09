@@ -59,6 +59,44 @@ def is_quiet(diff: float) -> bool:
     return diff < QUIET_DIFF
 
 
+# Share of a frame that must sit at one intensity for it to read as a user
+# interface rather than a photograph. A window, a terminal or a dialog has a
+# dominant flat background whichever theme it uses; a lock screen wallpaper,
+# a screensaver or a bare photo desktop does not.
+#
+# Measured on this engagement's captures: lock screens and a photo desktop
+# scored 19.0-20.1%, terminals 58.4-94.8%, and a light terminal inverted to
+# simulate a dark theme still scored 91.4%. The threshold sits in the gap.
+UI_FLAT_MIN = 0.40
+
+
+def flat_fraction(image: Image.Image, tol: int = 8) -> float:
+    """Largest share of the frame sitting within `tol` of one intensity.
+
+    Deliberately not OCR. Reading a lock screen's text was tried first and is
+    both unreliable, because it is white text over a photograph rather than the
+    terminal text Tesseract is tuned for here, and slow: 3.6 seconds a frame
+    against 11 milliseconds for this.
+    """
+    small = image.convert("L").resize((320, 180))
+    g = np.asarray(small, dtype=np.uint8)
+    hist = np.bincount(g.ravel(), minlength=256).astype(np.float32)
+    widened = np.convolve(hist, np.ones(2 * tol + 1), mode="same")
+    return float(widened.max() / g.size)
+
+
+def looks_like_ui(fraction: float) -> bool:
+    """Whether a frame looks like somewhere typed text would go.
+
+    This is a partial check and worth being honest about. It catches a locked
+    screen, a screensaver and a bare photo desktop, which is the failure that
+    has actually happened twice. It does NOT catch typing into the wrong
+    application, since Slack and a terminal both read as interfaces, and it
+    would pass a lock screen set to a plain colour.
+    """
+    return fraction >= UI_FLAT_MIN
+
+
 def is_blank(stdev: float) -> bool:
     """Whether a measured spread means the frame carries no picture.
 
@@ -71,6 +109,9 @@ def is_blank(stdev: float) -> bool:
 
 __all__ = [
     "BLANK_STDEV",
+    "UI_FLAT_MIN",
+    "flat_fraction",
+    "looks_like_ui",
     "QUIET_DIFF",
     "difference",
     "frame_stdev",

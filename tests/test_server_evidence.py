@@ -61,6 +61,35 @@ def blank_frame() -> Image.Image:
     return Image.new("RGB", (320, 180), (0, 0, 0))
 
 
+def photo_frame() -> Image.Image:
+    """A frame with no dominant flat shade, as a photograph has none.
+
+    The real failure looked like this: the lock screen captured on 08/11/2026
+    measured a spread of 40.8, far above the blank threshold of 2.0, because a
+    wallpaper is the least blank thing on the machine. Spread cannot catch it;
+    flatness can.
+    """
+    image = Image.new("RGB", (320, 180))
+    px = image.load()
+    for x in range(320):
+        for y in range(180):
+            # A smooth two-axis ramp with some texture, so no single intensity
+            # dominates and the histogram stays spread out.
+            v = (x * 255 // 320 + y * 255 // 180) // 2
+            px[x, y] = ((v + (x * y) % 37) % 256, v, (255 - v))
+    return image
+
+
+def ui_frame() -> Image.Image:
+    """A frame that reads as an interface: a flat ground with text on it."""
+    image = Image.new("RGB", (320, 180), (250, 250, 250))
+    px = image.load()
+    for row in range(10, 170, 12):
+        for x in range(8, 300, 2):
+            px[x, row] = (20, 20, 20)
+    return image
+
+
 class Harness:
     """A temporary log and capture directory, with the frame grab stubbed."""
 
@@ -206,12 +235,44 @@ def test_blank_frame_is_recorded_but_does_not_block():
         check(frames.is_blank(0.0), "a uniform field must measure as blank")
 
 
-def test_capture_failure_does_not_block_input():
-    with Harness(frame=None) as h:
-        with server._acting("type_text: whoami", "RO", "Terminal"):
-            h.sent.append("whoami")
+def test_capture_failure_blocks_keystrokes_but_not_the_pointer():
+    """The contract changed when the focus guard went in, deliberately.
 
-        check(h.sent == ["whoami"], "a capture failure must not block input")
+    It used to be that an input whose frame could not be captured still went,
+    on the grounds that driving a target must not depend on the capture card.
+    That is still true of the pointer, which is how a sleeping target is woken.
+    It is no longer true of keystrokes: without a frame there is nothing to
+    judge, and typing blind is the failure the guard exists to prevent.
+    """
+    with Harness(frame=None) as h:
+        refused = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        except server.FocusRefused:
+            refused = True
+        check(refused, "keystrokes must be refused when there is no frame")
+        check(h.sent == [], "and nothing transmitted")
+
+        with server._acting("mouse_move: relative (1, 0)", "RO", "Wake",
+                            keyboard=False):
+            h.sent.append("wake")
+        check(h.sent == ["wake"], "but the pointer must still go through")
+        row = [r for r in h.rows() if "mouse_move" in r["action"]][0]
+        check("capture unavailable" in row["result"],
+              f"and the row should say there was no frame: {row['result']!r}")
+
+
+def test_capture_failure_with_the_guard_off_still_sends():
+    with Harness(frame=None) as h:
+        server.config.focus_guard = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        finally:
+            server.config.focus_guard = True
+
+        check(h.sent == ["whoami"], "the override must restore the old contract")
         row = h.rows()[0]
         check(row["evidence"] == "", f"no frame, so no evidence: {row['evidence']!r}")
         check(
@@ -365,6 +426,100 @@ def test_quiet_threshold_is_well_clear_of_capture_noise():
     check(frames.difference(a, a) == 0.0, "a frame must not differ from itself")
     check(frames.is_quiet(0.039), "the measured noise floor must read as quiet")
     check(not frames.is_quiet(5.0), "a real screen change must not read as quiet")
+
+
+def test_keystrokes_are_refused_against_a_photographic_screen():
+    """The incident, replayed. A locked screen is a photograph, so the blank
+    check passes and the keystrokes land in the login field."""
+    with Harness(frame=photo_frame) as h:
+        refused = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        except server.FocusRefused as exc:
+            refused = True
+            check("does not look like an interface" in str(exc),
+                  f"the refusal should say why: {exc}")
+        check(refused, "keystrokes must be refused against a photographic frame")
+        check(h.sent == [], "nothing may be transmitted after a refusal")
+
+
+def test_the_refusal_is_itself_recorded():
+    """A refusal is evidence: somebody tried to type into a locked screen."""
+    with Harness(frame=photo_frame) as h:
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                pass
+        except server.FocusRefused:
+            pass
+        rows = h.rows()
+        check(len(rows) == 1, f"one row expected, got {len(rows)}")
+        check(rows[0]["action"].startswith("REFUSED"),
+              f"the row should record the refusal: {rows[0]['action']!r}")
+        check(rows[0]["evidence"] != "", "and cite the frame it refused on")
+
+
+def test_keystrokes_pass_against_an_interface():
+    with Harness(frame=ui_frame) as h:
+        with server._acting("type_text: whoami", "RO", "Terminal"):
+            h.sent.append("whoami")
+        check(h.sent == ["whoami"], "a normal screen must not be refused")
+        check(h.rows()[0]["action"] == "type_text: whoami", "and is logged normally")
+
+
+def test_the_pointer_is_never_guarded():
+    """Waking a sleeping target is a mouse move against a screen showing
+    nothing. Guarding it would restore the deadlock the wake path breaks."""
+    with Harness(frame=photo_frame) as h:
+        with server._acting("mouse_move: relative (1, 0)", "RO", "Wake",
+                            keyboard=False):
+            h.sent.append("wake")
+        check(h.sent == ["wake"], "a mouse move must go through regardless")
+
+
+def test_keystrokes_are_refused_when_there_is_no_frame_at_all():
+    """Without a frame there is no way to know where the keystrokes land."""
+    with Harness(frame=None) as h:
+        refused = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        except server.FocusRefused as exc:
+            refused = True
+            check("no frame" in str(exc), f"the refusal should say why: {exc}")
+        check(refused, "typing blind must be refused")
+        check(h.sent == [], "nothing transmitted")
+
+
+def test_the_guard_can_be_turned_off():
+    with Harness(frame=photo_frame) as h:
+        server.config.focus_guard = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        finally:
+            server.config.focus_guard = True
+        check(h.sent == ["whoami"], "the override must work")
+
+
+def test_flatness_separates_the_two_classes():
+    """Guards the ordering and the threshold, not the exact numbers."""
+    photo = frames.flat_fraction(photo_frame())
+    ui = frames.flat_fraction(ui_frame())
+    check(photo < frames.UI_FLAT_MIN, f"a photograph must read as such: {photo:.2f}")
+    check(ui >= frames.UI_FLAT_MIN, f"an interface must read as such: {ui:.2f}")
+    check(ui > photo, f"and the two must separate: ui {ui:.2f} vs photo {photo:.2f}")
+
+
+def test_flatness_survives_a_dark_theme():
+    """The signal is flatness, not brightness: inverting an interface must not
+    change the verdict, or every dark-themed terminal would be refused."""
+    from PIL import ImageOps
+
+    light = ui_frame()
+    dark = ImageOps.invert(light)
+    check(frames.looks_like_ui(frames.flat_fraction(dark)),
+          "an inverted interface must still read as one")
 
 
 def main() -> int:

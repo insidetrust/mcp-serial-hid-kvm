@@ -41,6 +41,15 @@ class Config:
             "SHKVM_PRESEND_EVIDENCE", "1"
         ).strip().lower() not in ("0", "false", "no", "off")
 
+        # Refuse keystrokes when the pre-send frame does not look like an
+        # interface: a locked screen, a screensaver or a bare desktop. On by
+        # default, because typing blind onto someone else's machine is the
+        # failure this exists to prevent and it has happened twice. Pointer
+        # calls are never guarded, so waking a sleeping target still works.
+        self.focus_guard: bool = os.environ.get(
+            "SHKVM_FOCUS_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
         # Capture log directory
         raw = os.environ.get("SHKVM_CAPTURE_LOG_DIR")
         if raw is None:

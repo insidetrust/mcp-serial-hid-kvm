@@ -58,6 +58,10 @@ def get_log() -> actionlog.ActionLog:
     return _log
 
 
+class FocusRefused(RuntimeError):
+    """Keyboard input was refused because the screen is not somewhere to type."""
+
+
 # Tools that put input into the target. These are the ones that must be logged
 # before they act, and that carry an action class.
 INPUT_TOOLS = {
@@ -68,6 +72,17 @@ INPUT_TOOLS = {
     "mouse_click",
     "mouse_drag",
     "mouse_scroll",
+    "execute_and_read",
+}
+
+# Input tools that deliver keystrokes. The focus guard applies to these and
+# not to the pointer: waking a sleeping target means moving the mouse when the
+# screen shows nothing worth looking at, and guarding that would restore the
+# deadlock the wake path exists to break.
+KEYBOARD_TOOLS = {
+    "type_text",
+    "send_key",
+    "send_key_sequence",
     "execute_and_read",
 }
 
@@ -83,7 +98,7 @@ ACTION_CLASS_PROP = {
 
 
 @contextlib.contextmanager
-def _acting(action: str, cls: str = "RO", context: str = ""):
+def _acting(action: str, cls: str = "RO", context: str = "", keyboard: bool = True):
     """Log an input action, then perform it.
 
     The row goes down BEFORE the keystrokes, so a crash mid-send can never
@@ -110,7 +125,25 @@ def _acting(action: str, cls: str = "RO", context: str = ""):
     """
     log = get_log()
     log.require()  # refuses here, before anything reaches the target
-    evidence, note = _presend_evidence()
+    evidence, note, frame = _presend_evidence()
+
+    if keyboard:
+        refusal = _refuse_keystrokes(frame)
+        if refusal is not None:
+            # A refusal is evidence too: it records that the target was in a
+            # state nobody should have typed into, at a time somebody tried.
+            try:
+                log.append(
+                    action=f"REFUSED {action}",
+                    result=refusal,
+                    evidence=evidence,
+                    cls=cls,
+                    context=context,
+                )
+            except actionlog.LogUnavailable:
+                pass
+            raise FocusRefused(refusal)
+
     log.append(
         action=action,
         result="sent through the HID bridge" + note,
@@ -167,20 +200,26 @@ def _write_frame(image: Image.Image, suffix: str = "") -> str | None:
         return None
 
 
-def _presend_evidence() -> tuple[str, str]:
+def _presend_evidence() -> tuple[str, str, Image.Image | None]:
     """The screen as it stood immediately before input is delivered.
 
-    Returns the evidence path and a note for the result cell, either of which
-    may be empty. Nothing here raises: see _acting on why input must not be
-    made to depend on the capture device.
+    Returns the evidence path, a note for the result cell, and the frame itself
+    so the caller can judge it. Any of the three may be empty or None. Nothing
+    here raises: the decision about what to do with a missing frame belongs to
+    _acting, which knows whether keystrokes or a mouse move are being sent.
     """
-    if not config.presend_evidence:
-        return "", ""
+    if not (config.presend_evidence or config.focus_guard):
+        return "", "", None
     try:
         image = _capture_image()
     except Exception as exc:
         logger.warning(f"no pre-send frame for the action log: {exc}")
-        return "", "; no pre-send frame, capture unavailable"
+        return "", "; no pre-send frame, capture unavailable", None
+
+    if not config.presend_evidence:
+        # The guard wants a frame but evidence is switched off, so judge it
+        # and keep nothing. Evidence and the guard are separate settings.
+        return "", "", image
 
     stdev = frames.frame_stdev(image)
     path = _write_frame(image, "presend") or ""
@@ -188,8 +227,46 @@ def _presend_evidence() -> tuple[str, str]:
         # Worth saying in the row. Input sent against a frame with no picture
         # may have gone nowhere visible, or into a window nobody chose, and
         # the saved frame on its own does not show that this was known.
-        return path, f"; screen carried no picture (spread {stdev:.2f})"
-    return path, ""
+        return path, f"; screen carried no picture (spread {stdev:.2f})", image
+    return path, "", image
+
+
+def _refuse_keystrokes(image: Image.Image | None) -> str | None:
+    """Why keystrokes must not be sent against this frame, or None to proceed.
+
+    Two refusals, and the second is the one that matters. Without a frame there
+    is no way to know where the keystrokes land, and typing blind onto someone
+    else's machine is the thing this exists to prevent. With a frame that reads
+    as a photograph rather than an interface, the screen is locked, asleep or
+    showing a bare desktop, and the keystrokes would go into a login field or
+    nowhere at all.
+
+    This has happened twice: 05/11/2026 through the console, which gained a
+    staleness guard as a result, and 08/11/2026 through this path, which had
+    none. The second frame measured a spread of 40.8 against a blank threshold
+    of 2.0, because a lock screen wallpaper is the least blank thing on the
+    machine, so neither existing check came close to catching it.
+    """
+    if not config.focus_guard:
+        return None
+    if image is None:
+        return (
+            "refusing to type: no frame of the target was captured, so there is "
+            "no way to know where the keystrokes would land. Move the mouse to "
+            "wake the target, capture the screen, and look at it. Set "
+            "SHKVM_FOCUS_GUARD=0 to send without this check."
+        )
+    fraction = frames.flat_fraction(image)
+    if not frames.looks_like_ui(fraction):
+        return (
+            f"refusing to type: the screen does not look like an interface "
+            f"({fraction:.0%} of it sits at one shade, against a threshold of "
+            f"{frames.UI_FLAT_MIN:.0%}). That is what a locked screen, a "
+            "screensaver or a bare desktop looks like, and keystrokes sent now "
+            "would most likely go into a login field. Capture the screen and "
+            "look before sending. Set SHKVM_FOCUS_GUARD=0 to override."
+        )
+    return None
 
 
 def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
@@ -641,7 +718,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             y = arguments["y"]
             relative = arguments.get("relative", False)
             kind = "relative" if relative else "absolute"
-            with _acting(f"mouse_move: {kind} ({x}, {y})", cls):
+            with _acting(f"mouse_move: {kind} ({x}, {y})", cls, keyboard=False):
                 client.mouse_move(x, y, relative)
             if relative:
                 return [TextContent(type="text", text=f"Moved mouse by ({x}, {y})")]
@@ -653,7 +730,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             x = arguments.get("x")
             y = arguments.get("y")
             where = f" at ({x}, {y})" if x is not None and y is not None else ""
-            with _acting(f"mouse_click: {button}{where}", cls):
+            with _acting(f"mouse_click: {button}{where}", cls, keyboard=False):
                 client.mouse_click(button, x, y)
             return [TextContent(type="text", text=f"Clicked {button}{where}")]
 
@@ -666,7 +743,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             action = (
                 f"mouse_drag: {button} ({start_x}, {start_y}) to ({end_x}, {end_y})"
             )
-            with _acting(action, cls):
+            with _acting(action, cls, keyboard=False):
                 client.mouse_down(button, start_x, start_y)
                 await asyncio.sleep(0.05)
                 client.mouse_move(end_x, end_y)
@@ -679,7 +756,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "mouse_scroll":
             amount = arguments["amount"]
-            with _acting(f"mouse_scroll: {amount}", cls):
+            with _acting(f"mouse_scroll: {amount}", cls, keyboard=False):
                 client.mouse_scroll(amount)
             direction = "up" if amount > 0 else "down"
             return [TextContent(type="text", text=f"Scrolled {direction} by {abs(amount)}")]
