@@ -222,10 +222,11 @@ def test_blank_frame_is_recorded_but_does_not_block():
     """A target that is asleep has no picture, and reaching it is exactly when
     input is needed. So the row says so and the input still goes."""
     with Harness(frame=blank_frame) as h:
-        with server._acting("mouse_move: relative (1, 0)", "RO", "Wake"):
+        with server._acting("mouse_move: relative (1, 0)", "RO", "Wake",
+                            keyboard=False):
             h.sent.append("wake")
 
-        check(h.sent == ["wake"], "a blank frame must not block input")
+        check(h.sent == ["wake"], "a blank frame must not block the pointer")
         row = h.rows()[0]
         check(
             "no picture" in row["result"],
@@ -520,6 +521,31 @@ def test_flatness_survives_a_dark_theme():
     dark = ImageOps.invert(light)
     check(frames.looks_like_ui(frames.flat_fraction(dark)),
           "an inverted interface must still read as one")
+
+
+def test_keystrokes_are_refused_against_a_sleeping_display():
+    """The gap the first live use found.
+
+    A frame with no picture is the flattest frame there is, so the interface
+    check passes it: 100% of it sits at one shade. The blank check has to run
+    first or a sleeping display is the one screen the guard waves through.
+    """
+    with Harness(frame=blank_frame) as h:
+        refused = False
+        try:
+            with server._acting("type_text: whoami", "RO", "Terminal"):
+                h.sent.append("whoami")
+        except server.FocusRefused as exc:
+            refused = True
+            check("no picture" in str(exc), f"the refusal should say why: {exc}")
+        check(refused, "keystrokes must be refused against a blank screen")
+        check(h.sent == [], "nothing transmitted")
+
+        # And the thing that makes it a trap, asserted directly.
+        flat = frames.flat_fraction(blank_frame())
+        check(frames.looks_like_ui(flat),
+              f"a blank frame reads as maximally flat ({flat:.0%}), which is "
+              "why the blank check cannot be left to the interface check")
 
 
 def main() -> int:

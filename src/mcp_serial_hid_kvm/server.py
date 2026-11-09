@@ -256,6 +256,20 @@ def _refuse_keystrokes(image: Image.Image | None) -> str | None:
             "wake the target, capture the screen, and look at it. Set "
             "SHKVM_FOCUS_GUARD=0 to send without this check."
         )
+    # Order matters. A frame with no picture is the flattest frame there is,
+    # so the interface check below would wave a sleeping display straight
+    # through: 100% of it sits at one shade. Found on 09/11/2026 by pointing
+    # the guard at a real target whose display had slept.
+    stdev = frames.frame_stdev(image)
+    if frames.is_blank(stdev):
+        return (
+            f"refusing to type: the screen carries no picture (spread "
+            f"{stdev:.2f}, below {frames.BLANK_STDEV}). The display is asleep "
+            "or the capture card has no signal, so the keystrokes would go "
+            "somewhere nobody can see. Move the mouse to wake the target, then "
+            "capture. Set SHKVM_FOCUS_GUARD=0 to override."
+        )
+
     fraction = frames.flat_fraction(image)
     if not frames.looks_like_ui(fraction):
         return (
