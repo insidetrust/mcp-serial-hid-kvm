@@ -429,31 +429,11 @@ def test_quiet_threshold_is_well_clear_of_capture_noise():
     check(not frames.is_quiet(5.0), "a real screen change must not read as quiet")
 
 
-def test_a_shell_command_is_refused_against_a_photographic_screen():
-    """The incident, replayed. A locked screen is a photograph, so the blank
-    check passes it and the command lands in the login field."""
-    with Harness(frame=photo_frame) as h:
-        refused = False
-        try:
-            with server._acting("execute_and_read: whoami then Enter", "RO",
-                                "Terminal", expect_terminal=True):
-                h.sent.append("whoami")
-        except server.FocusRefused as exc:
-            refused = True
-            check("does not look like a terminal" in str(exc),
-                  f"the refusal should say why: {exc}")
-        check(refused, "a shell command must be refused against a photograph")
-        check(h.sent == [], "nothing may be transmitted after a refusal")
-
-
 def test_driving_a_graphical_interface_is_not_blocked():
-    """Ben's requirement, and the reason the strict check is scoped.
-
-    Driving a GUI is a first-class use. The flatness check cannot serve it:
-    measured on a real target, an unlocked desktop with an application window
-    open scored 19.3% against a lock screen's 19.0-20.1%, because the same
-    wallpaper fills both. Holding type_text to that threshold would block
-    every click-and-type workflow on a machine with a photo wallpaper.
+    """Driving a GUI is a first-class use and must not be gated on the screen
+    looking like a terminal. A photographic frame is an unlocked desktop as
+    often as it is a lock screen: measured on a real target, a desktop with an
+    application window open scored 19.3% against a lock screen's 19.0-20.1%.
     """
     with Harness(frame=photo_frame) as h:
         with server._acting("type_text: hello", "RO", "Finder"):
@@ -466,11 +446,12 @@ def test_driving_a_graphical_interface_is_not_blocked():
 
 
 def test_the_refusal_is_itself_recorded():
-    """A refusal is evidence: somebody tried to type into a locked screen."""
-    with Harness(frame=photo_frame) as h:
+    """A refusal is evidence: somebody tried to type at a screen nobody could
+    see, at a time, and the row cites the frame that was refused on."""
+    with Harness(frame=blank_frame) as h:
         try:
             with server._acting("execute_and_read: whoami then Enter", "RO",
-                                "Terminal", expect_terminal=True):
+                                "Terminal"):
                 pass
         except server.FocusRefused:
             pass
@@ -479,15 +460,6 @@ def test_the_refusal_is_itself_recorded():
         check(rows[0]["action"].startswith("REFUSED"),
               f"the row should record the refusal: {rows[0]['action']!r}")
         check(rows[0]["evidence"] != "", "and cite the frame it refused on")
-
-
-def test_a_shell_command_passes_against_a_flat_screen():
-    with Harness(frame=ui_frame) as h:
-        with server._acting("type_text: whoami", "RO", "Terminal",
-                            expect_terminal=True):
-            h.sent.append("whoami")
-        check(h.sent == ["whoami"], "a normal screen must not be refused")
-        check(h.rows()[0]["action"] == "type_text: whoami", "and is logged normally")
 
 
 def test_the_pointer_is_never_guarded():
@@ -529,38 +501,16 @@ def test_the_blank_check_applies_to_every_keyboard_tool():
     """A sleeping display is detectable on any operating system, so unlike the
     flatness check this one is not scoped to shell commands."""
     with Harness(frame=blank_frame) as h:
-        for action, expect in (("type_text: hello", False),
-                               ("send_key: enter", False),
-                               ("execute_and_read: id then Enter", True)):
+        for action in ("type_text: hello", "send_key: enter",
+                       "execute_and_read: id then Enter"):
             refused = False
             try:
-                with server._acting(action, "RO", "Finder",
-                                    expect_terminal=expect):
+                with server._acting(action, "RO", "Finder"):
                     h.sent.append(action)
             except server.FocusRefused:
                 refused = True
             check(refused, f"a blank screen must refuse {action!r}")
         check(h.sent == [], "nothing transmitted against a blank screen")
-
-
-def test_flatness_separates_the_two_classes():
-    """Guards the ordering and the threshold, not the exact numbers."""
-    photo = frames.flat_fraction(photo_frame())
-    ui = frames.flat_fraction(ui_frame())
-    check(photo < frames.FLAT_BACKGROUND_MIN, f"a photograph must read as such: {photo:.2f}")
-    check(ui >= frames.FLAT_BACKGROUND_MIN, f"an interface must read as such: {ui:.2f}")
-    check(ui > photo, f"and the two must separate: ui {ui:.2f} vs photo {photo:.2f}")
-
-
-def test_flatness_survives_a_dark_theme():
-    """The signal is flatness, not brightness: inverting an interface must not
-    change the verdict, or every dark-themed terminal would be refused."""
-    from PIL import ImageOps
-
-    light = ui_frame()
-    dark = ImageOps.invert(light)
-    check(frames.has_flat_background(frames.flat_fraction(dark)),
-          "an inverted interface must still read as one")
 
 
 def test_keystrokes_are_refused_against_a_sleeping_display():
@@ -581,11 +531,6 @@ def test_keystrokes_are_refused_against_a_sleeping_display():
         check(refused, "keystrokes must be refused against a blank screen")
         check(h.sent == [], "nothing transmitted")
 
-        # And the thing that makes it a trap, asserted directly.
-        flat = frames.flat_fraction(blank_frame())
-        check(frames.has_flat_background(flat),
-              f"a blank frame reads as maximally flat ({flat:.0%}), which is "
-              "why the blank check cannot be left to the interface check")
 
 
 def main() -> int:

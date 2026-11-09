@@ -98,13 +98,7 @@ ACTION_CLASS_PROP = {
 
 
 @contextlib.contextmanager
-def _acting(
-    action: str,
-    cls: str = "RO",
-    context: str = "",
-    keyboard: bool = True,
-    expect_terminal: bool = False,
-):
+def _acting(action: str, cls: str = "RO", context: str = "", keyboard: bool = True):
     """Log an input action, then perform it.
 
     The row goes down BEFORE the keystrokes, so a crash mid-send can never
@@ -134,7 +128,7 @@ def _acting(
     evidence, note, frame = _presend_evidence()
 
     if keyboard:
-        refusal = _refuse_keystrokes(frame, expect_terminal)
+        refusal = _refuse_keystrokes(frame)
         if refusal is not None:
             # A refusal is evidence too: it records that the target was in a
             # state nobody should have typed into, at a time somebody tried.
@@ -237,23 +231,30 @@ def _presend_evidence() -> tuple[str, str, Image.Image | None]:
     return path, "", image
 
 
-def _refuse_keystrokes(
-    image: Image.Image | None, expect_terminal: bool = False
-) -> str | None:
+def _refuse_keystrokes(image: Image.Image | None) -> str | None:
     """Why keystrokes must not be sent against this frame, or None to proceed.
 
-    Two refusals, and the second is the one that matters. Without a frame there
-    is no way to know where the keystrokes land, and typing blind onto someone
-    else's machine is the thing this exists to prevent. With a frame that reads
-    as a photograph rather than an interface, the screen is locked, asleep or
-    showing a bare desktop, and the keystrokes would go into a login field or
-    nowhere at all.
+    One rule: do not type at a screen nobody can see. Without a frame there is
+    no way to know where the keystrokes land; a blank frame means the display
+    is asleep or the capture card has no signal. Free to check, identical on
+    every operating system, and no false positives.
 
-    This has happened twice: 05/11/2026 through the console, which gained a
-    staleness guard as a result, and 08/11/2026 through this path, which had
-    none. The second frame measured a spread of 40.8 against a blank threshold
-    of 2.0, because a lock screen wallpaper is the least blank thing on the
-    machine, so neither existing check came close to catching it.
+    Deliberately nothing more. A lock screen showing a picture is not caught,
+    and that is a judged trade rather than an oversight. A flatness heuristic
+    that did catch it was built and then removed: it needed a threshold
+    measured against one operating system's wallpaper, it could not tell a
+    lock screen from an unlocked desktop with a window open (19.0-20.1%
+    against 19.3%), and a solid-colour Windows desktop would have passed it
+    outright. It also had to be fenced off from type_text to avoid blocking
+    every click-and-type workflow.
+
+    The harm it prevented is bounded. A persistent account lockout wants three
+    to five failures in quick succession; one stray command is a failed
+    authentication and a disclosure item, not an incident.
+
+    The primary control is the operator: confirm the screen is unlocked and
+    keep it awake. This is the backstop for when that lapses, so it guards
+    only what is free to detect and true everywhere.
     """
     if not config.focus_guard:
         return None
@@ -264,10 +265,6 @@ def _refuse_keystrokes(
             "wake the target, capture the screen, and look at it. Set "
             "SHKVM_FOCUS_GUARD=0 to send without this check."
         )
-    # Order matters. A frame with no picture is the flattest frame there is,
-    # so the interface check below would wave a sleeping display straight
-    # through: 100% of it sits at one shade. Found on 09/11/2026 by pointing
-    # the guard at a real target whose display had slept.
     stdev = frames.frame_stdev(image)
     if frames.is_blank(stdev):
         return (
@@ -276,32 +273,6 @@ def _refuse_keystrokes(
             "or the capture card has no signal, so the keystrokes would go "
             "somewhere nobody can see. Move the mouse to wake the target, then "
             "capture. Set SHKVM_FOCUS_GUARD=0 to override."
-        )
-
-    if not expect_terminal:
-        # Driving a graphical interface is a first-class use, and the
-        # interface check below cannot serve it. Measured on this target, an
-        # unlocked desktop with an application window open scored 19.3% flat
-        # against a lock screen's 19.0-20.1%: the same wallpaper fills both,
-        # and the menu bar and dock are translucent and thin enough to be
-        # swamped. The top strip and the dock band were tried too and separate
-        # no better. So for anything but a shell command the blank check above
-        # is the whole guard, because it is the part that is actually
-        # measurable.
-        return None
-
-    fraction = frames.flat_fraction(image)
-    if not frames.has_flat_background(fraction):
-        return (
-            f"refusing to run a command: the screen does not look like a "
-            f"terminal "
-            f"({fraction:.0%} of it sits at one shade, against a threshold of "
-            f"{frames.FLAT_BACKGROUND_MIN:.0%}). A locked screen, a screensaver and a "
-            "desktop with a wallpaper all look like this, and a shell command "
-            "sent now would most likely go into a login field. Capture the "
-            "screen and look. If you meant to drive a graphical interface "
-            "rather than run a command, use type_text and the mouse tools, "
-            "which are not held to this check. SHKVM_FOCUS_GUARD=0 overrides."
         )
     return None
 
@@ -834,9 +805,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
             # Raw mode: no tag interpretation for command text
             validate_chars(command)
-            with _acting(
-                f"execute_and_read: {command} then Enter", cls, expect_terminal=True
-            ):
+            with _acting(f"execute_and_read: {command} then Enter", cls):
                 client.type_text(command, raw=True)
                 await asyncio.sleep(0.1)
                 client.send_key("enter")
