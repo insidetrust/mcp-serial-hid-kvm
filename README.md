@@ -78,6 +78,7 @@ Custom KVM server address:
 | `SHKVM_ACTION_LOG` | platform default | Action log file (empty string to disable, which also refuses all input) |
 | `SHKVM_COLOUR_CORRECT` | `1` | Apply the capture device's measured colour correction to every frame |
 | `SHKVM_PRESEND_EVIDENCE` | `1` | Save the frame from just before each input action and cite it in the log |
+| `SHKVM_FOCUS_GUARD` | `1` | Refuse keystrokes when no frame could be captured, or the frame carries no picture |
 
 Hardware settings (`SHKVM_SERIAL_PORT`, `SHKVM_SCREEN_WIDTH`, etc.) are configured on the **KVM server side**, not here. If the target PC uses a non-US keyboard, set `--target-layout` (or `SHKVM_TARGET_LAYOUT`) on the KVM server so that `type_text` and `send_key` produce correct characters.
 
@@ -100,6 +101,18 @@ the row says so.
 
 Set `SHKVM_ACTION_LOG=""` to turn logging off, which also disables every input
 tool. There is no mode that sends input without recording it.
+
+### Typing at a screen nobody can see
+
+Keystrokes are refused when no frame could be captured, or when the frame
+carries no picture: the display is asleep, or the capture card has no signal.
+The pointer is exempt, because waking a sleeping target means moving the mouse
+at exactly such a screen. `SHKVM_FOCUS_GUARD=0` turns it off.
+
+That is the whole check. A lock screen showing a picture is not detected, and
+that is deliberate: no cheap whole-frame measure separates one from an unlocked
+desktop with a window open, and a check that tried blocked graphical work
+instead.
 
 ## Available Tools
 
